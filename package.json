@@ -9,6 +9,9 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@picovoice/cobra-web": "^2.0.3",
+    "@picovoice/web-utils": "^1.4.3",
+    "@picovoice/web-voice-processor": "^4.0.9",
     "@radix-ui/react-icons": "^1.3.0",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
