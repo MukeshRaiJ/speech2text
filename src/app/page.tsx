@@ -1,156 +1,150 @@
 "use client";
-import React, { useEffect, useState, useRef } from "react";
-import { AssemblyAI } from "assemblyai";
+import React, { useState, useRef, useEffect } from "react";
 import { CobraWorker } from "@picovoice/cobra-web";
 import { WebVoiceProcessor } from "@picovoice/web-voice-processor";
 
-const PICOVOICE_ACCESS_KEY = process.env.NEXT_PUBLIC_PICOVOICE_ACCESS_KEY;
-const ASSEMBLY_API_KEY = process.env.NEXT_PUBLIC_ASSEMBLY_API_KEY;
-
-const VOICE_PROBABILITY_THRESHOLD = 0.2;
-const SILENCE_DURATION_THRESHOLD = 1500;
-const MIN_RECORDING_DURATION = 500;
-
-interface AudioClip {
-  id: number;
-  url: string;
-  timestamp: Date;
-  duration: number;
-  transcription?: string;
-  isTranscribing?: boolean;
-  transcriptionError?: string;
-  speakers?: { speaker: string; text: string }[];
+interface Timestamps {
+  words: string[];
+  start_time_seconds: number[];
+  end_time_seconds: number[];
 }
 
-const VoiceDetector: React.FC = () => {
+interface TranscriptionResponse {
+  transcript: string;
+  timestamps: Timestamps | null;
+}
+
+// Environment variable type declarations
+declare global {
+  interface Window {
+    ENV: {
+      PICOVOICE_ACCESS_KEY: string;
+      ASSEMBLY_API_KEY: string;
+      SARVAM_API_KEY: string;
+    };
+  }
+}
+
+// Constants for voice detection and silence handling
+const VOICE_PROBABILITY_THRESHOLD = 0.5;
+const SILENCE_DURATION_THRESHOLD = 1500; // 1.5 seconds of silence before stopping
+const MIN_RECORDING_DURATION = 500; // Minimum recording duration of 0.5 seconds
+const DEBUG = true;
+
+// Get environment variables
+const getEnvVariables = () => ({
+  PICOVOICE_ACCESS_KEY: process.env.NEXT_PUBLIC_PICOVOICE_ACCESS_KEY,
+  ASSEMBLY_API_KEY: process.env.NEXT_PUBLIC_ASSEMBLY_API_KEY,
+  SARVAM_API_KEY: process.env.NEXT_PUBLIC_API_KEY,
+});
+
+// Helper function to convert float32 to 16-bit PCM
+function floatTo16BitPCM(
+  output: DataView,
+  offset: number,
+  input: Float32Array
+) {
+  for (let i = 0; i < input.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+}
+
+// Helper function to write string to DataView
+function writeString(view: DataView, offset: number, string: string) {
+  for (let i = 0; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
+// Convert AudioBuffer to WAV Blob
+function bufferToWav(audioBuffer: AudioBuffer): Blob {
+  const numOfChan = audioBuffer.numberOfChannels;
+  const length = audioBuffer.length * numOfChan * 2;
+  const buffer = new ArrayBuffer(44 + length);
+  const view = new DataView(buffer);
+  let pos = 0;
+
+  // write WAVE header
+  writeString(view, pos, "RIFF");
+  pos += 4;
+  view.setUint32(pos, 36 + length, true);
+  pos += 4;
+  writeString(view, pos, "WAVE");
+  pos += 4;
+  writeString(view, pos, "fmt ");
+  pos += 4;
+  view.setUint32(pos, 16, true);
+  pos += 4;
+  view.setUint16(pos, 1, true);
+  pos += 2;
+  view.setUint16(pos, numOfChan, true);
+  pos += 2;
+  view.setUint32(pos, audioBuffer.sampleRate, true);
+  pos += 4;
+  view.setUint32(pos, audioBuffer.sampleRate * numOfChan * 2, true);
+  pos += 4;
+  view.setUint16(pos, numOfChan * 2, true);
+  pos += 2;
+  view.setUint16(pos, 16, true);
+  pos += 2;
+  writeString(view, pos, "data");
+  pos += 4;
+  view.setUint32(pos, length, true);
+  pos += 4;
+
+  // write PCM data
+  const data = new Float32Array(audioBuffer.length * numOfChan);
+  let offset = 0;
+
+  for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
+    data.set(audioBuffer.getChannelData(i), offset);
+    offset += audioBuffer.length;
+  }
+
+  floatTo16BitPCM(view, 44, data);
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+// Convert Blob to AudioBuffer
+async function blobToAudioBuffer(
+  blob: Blob,
+  audioContext: AudioContext
+): Promise<AudioBuffer> {
+  const arrayBuffer = await blob.arrayBuffer();
+  return await audioContext.decodeAudioData(arrayBuffer);
+}
+
+const RealtimeSpeechToText = () => {
   const [isInitialized, setIsInitialized] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
-  const [audioClips, setAudioClips] = useState<AudioClip[]>([]);
-  const [latestClip, setLatestClip] = useState<AudioClip | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [transcription, setTranscription] =
+    useState<TranscriptionResponse | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [lastResponseTime, setLastResponseTime] = useState<number | null>(null);
 
+  // Refs for managing state across callbacks
   const isListeningRef = useRef(false);
   const isRecordingRef = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
+  const chunksRef = useRef<Blob[]>([]);
   const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const recordingStartTimeRef = useRef<number | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const cobraRef = useRef<CobraWorker | null>(null);
-  const assemblyClientRef = useRef<AssemblyAI | null>(null);
+  const recordingStartTimeRef = useRef<number | null>(null);
 
-  useEffect(() => {
-    if (ASSEMBLY_API_KEY) {
-      assemblyClientRef.current = new AssemblyAI({
-        apiKey: ASSEMBLY_API_KEY,
-      });
-    }
-  }, []);
-
-  const updateClipTranscription = (
-    clipId: number,
-    updates: Partial<AudioClip>
-  ) => {
-    setAudioClips((prevClips) =>
-      prevClips.map((clip) =>
-        clip.id === clipId ? { ...clip, ...updates } : clip
-      )
-    );
-    setLatestClip((prevClip) =>
-      prevClip?.id === clipId ? { ...prevClip, ...updates } : prevClip
-    );
-  };
-
-  const transcribeAudio = async (
-    audioBlob: Blob,
-    clipId: number
-  ): Promise<void> => {
-    if (!ASSEMBLY_API_KEY || !assemblyClientRef.current) {
-      throw new Error("AssemblyAI client is not configured");
-    }
-
-    updateClipTranscription(clipId, { isTranscribing: true });
-
-    try {
-      // Convert the blob to a File object
-      const audioFile = new File([audioBlob], "recording.webm", {
-        type: "audio/webm",
-      });
-
-      // Set up transcription parameters
-      const params = {
-        audio: audioFile,
-        speaker_labels: true, // Enable speaker diarization
-      };
-
-      // Start the transcription
-      const transcript = await assemblyClientRef.current.transcripts.transcribe(
-        params
-      );
-
-      if (transcript.status === "error") {
-        throw new Error(transcript.error);
-      }
-
-      // Extract speakers and their utterances if available
-      const speakers = transcript.utterances?.map((utterance) => ({
-        speaker: utterance.speaker,
-        text: utterance.text,
-      }));
-
-      // Update the clip with transcription and speaker information
-      updateClipTranscription(clipId, {
-        transcription: transcript.text,
-        speakers: speakers,
-        isTranscribing: false,
-      });
-    } catch (error) {
-      console.error("Transcription error:", error);
-      const errorMessage =
-        error instanceof Error ? error.message : "Transcription failed";
-      updateClipTranscription(clipId, {
-        transcriptionError: errorMessage,
-        isTranscribing: false,
-      });
-    }
-  };
-
-  const handleVoiceDetected = async () => {
-    if (silenceTimeoutRef.current) {
-      clearTimeout(silenceTimeoutRef.current);
-      silenceTimeoutRef.current = null;
-    }
-
-    if (
-      !isRecordingRef.current &&
-      isListeningRef.current &&
-      streamRef.current &&
-      !isProcessing
-    ) {
-      try {
-        await startRecording();
-      } catch (err) {
-        console.error("Voice detection error:", err);
-        setError("Error detecting voice");
-      }
-    }
-  };
-
-  const handleSilenceDetected = () => {
-    if (!silenceTimeoutRef.current && isRecordingRef.current && !isProcessing) {
-      silenceTimeoutRef.current = setTimeout(() => {
-        stopRecording();
-        silenceTimeoutRef.current = null;
-      }, SILENCE_DURATION_THRESHOLD);
-    }
-  };
-
+  // Initialize voice detector and audio setup
   const initializeVoiceDetector = async () => {
     try {
-      if (!PICOVOICE_ACCESS_KEY) {
-        throw new Error("Picovoice access key is not configured");
+      const env = getEnvVariables();
+
+      if (!env.PICOVOICE_ACCESS_KEY) {
+        throw new Error(
+          "Picovoice access key is not configured in environment variables"
+        );
       }
 
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -158,12 +152,17 @@ const VoiceDetector: React.FC = () => {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
+          sampleRate: 16000,
+          channelCount: 1,
         },
       });
 
       streamRef.current = stream;
 
       const handleVoiceProbability = (probability: number) => {
+        if (DEBUG) {
+          console.log("Voice probability:", probability);
+        }
         if (probability >= VOICE_PROBABILITY_THRESHOLD) {
           void handleVoiceDetected();
         } else {
@@ -172,7 +171,7 @@ const VoiceDetector: React.FC = () => {
       };
 
       const cobraInstance = await CobraWorker.create(
-        PICOVOICE_ACCESS_KEY,
+        env.PICOVOICE_ACCESS_KEY,
         handleVoiceProbability
       );
 
@@ -189,6 +188,110 @@ const VoiceDetector: React.FC = () => {
     }
   };
 
+  const handleVoiceDetected = async () => {
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+      silenceTimeoutRef.current = null;
+    }
+
+    if (
+      !isRecordingRef.current &&
+      isListeningRef.current &&
+      streamRef.current &&
+      !isProcessing
+    ) {
+      if (DEBUG) console.log("Voice detected, starting recording");
+      await startRecording();
+    }
+  };
+
+  const handleSilenceDetected = () => {
+    if (!silenceTimeoutRef.current && isRecordingRef.current) {
+      silenceTimeoutRef.current = setTimeout(() => {
+        if (DEBUG) console.log("Silence detected, stopping recording");
+        stopRecording();
+        silenceTimeoutRef.current = null;
+      }, SILENCE_DURATION_THRESHOLD);
+    }
+  };
+
+  const processAndSendAudio = async (audioBlob: Blob) => {
+    try {
+      const env = getEnvVariables();
+
+      if (!env.SARVAM_API_KEY) {
+        throw new Error(
+          "Sarvam API key is not configured in environment variables"
+        );
+      }
+
+      if (DEBUG) {
+        console.log("Processing audio:", {
+          originalSize: audioBlob.size,
+          originalType: audioBlob.type,
+        });
+      }
+
+      // Create AudioContext with specific sample rate
+      const audioContext = new (window.AudioContext ||
+        (window as any).webkitAudioContext)({
+        sampleRate: 16000,
+      });
+
+      // Convert blob to AudioBuffer
+      const audioBuffer = await blobToAudioBuffer(audioBlob, audioContext);
+
+      // Convert to WAV
+      const wavBlob = bufferToWav(audioBuffer);
+
+      if (DEBUG) {
+        console.log("Converted audio:", {
+          wavSize: wavBlob.size,
+          wavType: wavBlob.type,
+          sampleRate: audioBuffer.sampleRate,
+          channels: audioBuffer.numberOfChannels,
+          duration: audioBuffer.duration,
+        });
+      }
+
+      const formData = new FormData();
+      formData.append("file", wavBlob, "recording.wav");
+      formData.append("language_code", "hi-IN");
+      formData.append("model", "saarika:v1");
+      formData.append("with_timestamps", "true");
+
+      const response = await fetch("https://api.sarvam.ai/speech-to-text", {
+        method: "POST",
+        headers: {
+          "api-subscription-key": env.SARVAM_API_KEY,
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`API Error (${response.status}): ${errorText}`);
+      }
+
+      const data = await response.json();
+      setLastResponseTime(Date.now());
+
+      if (DEBUG) {
+        console.log("API Response:", data);
+      }
+
+      setTranscription((prev) => ({
+        transcript: prev
+          ? prev.transcript + " " + data.transcript
+          : data.transcript,
+        timestamps: data.timestamps,
+      }));
+    } catch (err) {
+      console.error("API Error:", err);
+      setError(err instanceof Error ? err.message : "Transcription failed");
+    }
+  };
+
   const startRecording = async () => {
     if (
       !streamRef.current ||
@@ -201,65 +304,50 @@ const VoiceDetector: React.FC = () => {
     setIsProcessing(true);
 
     try {
-      const options = { mimeType: "audio/webm;codecs=opus" };
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        throw new Error(`MIME type ${options.mimeType} is not supported`);
-      }
+      const options = {
+        mimeType: "audio/webm;codecs=opus",
+        bitsPerSecond: 16000,
+      };
 
       const mediaRecorder = new MediaRecorder(streamRef.current, options);
       mediaRecorderRef.current = mediaRecorder;
-      audioChunksRef.current = [];
+      chunksRef.current = [];
 
       const startTime = Date.now();
       recordingStartTimeRef.current = startTime;
 
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
+          chunksRef.current.push(event.data);
         }
       };
 
       mediaRecorder.onstop = async () => {
-        const endTime = Date.now();
-        const duration = startTime ? endTime - startTime : 0;
+        try {
+          const duration = Date.now() - (recordingStartTimeRef.current || 0);
 
-        if (
-          duration >= MIN_RECORDING_DURATION &&
-          audioChunksRef.current.length > 0
-        ) {
-          try {
-            const audioBlob = new Blob(audioChunksRef.current, {
-              type: "audio/webm",
+          if (
+            duration >= MIN_RECORDING_DURATION &&
+            chunksRef.current.length > 0
+          ) {
+            const audioBlob = new Blob(chunksRef.current, {
+              type: "audio/webm;codecs=opus",
             });
-            const audioUrl = URL.createObjectURL(audioBlob);
-
-            const newClip: AudioClip = {
-              id: Date.now(),
-              url: audioUrl,
-              timestamp: new Date(),
-              duration: duration / 1000,
-              isTranscribing: true,
-            };
-
-            setLatestClip(newClip);
-            setAudioClips((prev) => [newClip, ...prev]);
-
-            // Start transcription in the background
-            void transcribeAudio(audioBlob, newClip.id);
-          } catch (err) {
-            console.error("Failed to create audio clip:", err);
-            setError("Failed to create audio clip");
+            await processAndSendAudio(audioBlob);
           }
+        } catch (err) {
+          console.error("Error processing recording:", err);
+          setError("Failed to process recording");
+        } finally {
+          chunksRef.current = [];
+          isRecordingRef.current = false;
+          recordingStartTimeRef.current = null;
+          setIsRecording(false);
+          setIsProcessing(false);
         }
-
-        audioChunksRef.current = [];
-        isRecordingRef.current = false;
-        recordingStartTimeRef.current = null;
-        setIsRecording(false);
-        setIsProcessing(false);
       };
 
-      mediaRecorder.start(500);
+      mediaRecorder.start(500); // Record in 500ms chunks
       isRecordingRef.current = true;
       setIsRecording(true);
     } catch (err) {
@@ -271,13 +359,8 @@ const VoiceDetector: React.FC = () => {
 
   const stopRecording = () => {
     if (mediaRecorderRef.current?.state === "recording") {
-      try {
-        mediaRecorderRef.current.stop();
-      } catch (err) {
-        console.error("Stop recording error:", err);
-        setError("Failed to stop recording");
-        setIsProcessing(false);
-      }
+      if (DEBUG) console.log("Stopping recording");
+      mediaRecorderRef.current.stop();
     }
   };
 
@@ -289,8 +372,9 @@ const VoiceDetector: React.FC = () => {
       isListeningRef.current = true;
       setIsListening(true);
       setError(null);
+      if (DEBUG) console.log("Started listening for voice activity");
     } catch (err) {
-      console.error("Start error:", err);
+      console.error("Start listening error:", err);
       setError("Failed to start listening");
     }
   };
@@ -306,8 +390,9 @@ const VoiceDetector: React.FC = () => {
       isListeningRef.current = false;
       setIsListening(false);
       setError(null);
+      if (DEBUG) console.log("Stopped listening for voice activity");
     } catch (err) {
-      console.error("Stop error:", err);
+      console.error("Stop listening error:", err);
       setError("Failed to stop listening");
     }
   };
@@ -325,7 +410,6 @@ const VoiceDetector: React.FC = () => {
       if (cobraRef.current) {
         void cobraRef.current.release();
       }
-      audioClips.forEach((clip) => URL.revokeObjectURL(clip.url));
     };
   }, []);
 
@@ -335,7 +419,7 @@ const VoiceDetector: React.FC = () => {
         <div className="mb-4 p-4 bg-red-100 text-red-700 rounded">{error}</div>
       )}
 
-      <div className="mb-4">
+      <div className="mb-4 flex items-center gap-4">
         {isListening ? (
           <button
             onClick={() => void stopListening()}
@@ -352,118 +436,64 @@ const VoiceDetector: React.FC = () => {
             Start Listening
           </button>
         )}
+
+        {isRecording && (
+          <div className="flex items-center text-yellow-600">
+            <div className="w-2 h-2 bg-yellow-600 rounded-full animate-pulse mr-2"></div>
+            Recording...
+          </div>
+        )}
+
+        {isProcessing && !isRecording && (
+          <div className="flex items-center text-blue-600">
+            <div className="w-2 h-2 bg-blue-600 rounded-full animate-pulse mr-2"></div>
+            Processing...
+          </div>
+        )}
       </div>
 
-      {isRecording && (
-        <div className="mb-4 p-2 bg-yellow-50 text-yellow-600 rounded flex items-center">
-          <div className="w-2 h-2 bg-yellow-600 rounded-full animate-pulse mr-2"></div>
-          Recording...
-        </div>
-      )}
-
-      {latestClip && (
-        <div className="mb-4 p-4 bg-gray-100 rounded shadow-sm">
-          <h3 className="text-lg font-semibold mb-2">Latest Recording</h3>
-          <audio controls src={latestClip.url} className="w-full mb-2" />
-          <p className="mb-2 text-gray-700">
-            <strong>Duration:</strong> {latestClip.duration.toFixed(2)} seconds
-          </p>
-          {latestClip.isTranscribing ? (
-            <div className="flex items-center text-yellow-600">
-              <div className="w-2 h-2 bg-yellow-600 rounded-full animate-pulse mr-2"></div>
-              Transcribing...
-            </div>
-          ) : latestClip.transcriptionError ? (
-            <p className="text-red-600">
-              Transcription error: {latestClip.transcriptionError}
+      {transcription && (
+        <div className="mt-4 space-y-4">
+          <div>
+            <h3 className="font-bold text-lg mb-2">Transcription:</h3>
+            <p className="p-4 bg-gray-50 rounded shadow-sm">
+              {transcription.transcript}
             </p>
-          ) : (
-            <>
-              {latestClip.transcription && (
-                <div className="mb-4">
-                  <h4 className="font-semibold mb-1">Full Transcription:</h4>
-                  <p className="text-gray-800 bg-white p-2 rounded">
-                    {latestClip.transcription}
-                  </p>
-                </div>
-              )}
-              {latestClip.speakers && latestClip.speakers.length > 0 && (
-                <div>
-                  <h4 className="font-semibold mb-2">Speakers:</h4>
-                  <ul className="space-y-2">
-                    {latestClip.speakers.map((utterance, index) => (
-                      <li key={index} className="bg-white p-2 rounded">
-                        <span className="font-medium text-blue-600">
-                          Speaker {utterance.speaker}:
-                        </span>{" "}
-                        <span className="text-gray-800">{utterance.text}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
+          </div>
 
-      {audioClips.length > 0 && (
-        <div className="mb-4">
-          <h2 className="text-xl font-bold mb-4">Previous Recordings</h2>
-          <ul className="space-y-4">
-            {audioClips.map((clip) => (
-              <li key={clip.id} className="p-4 bg-gray-50 rounded shadow-sm">
-                <audio controls src={clip.url} className="w-full mb-2" />
-                <p className="mb-2 text-gray-700">
-                  <strong>Duration:</strong> {clip.duration.toFixed(2)} seconds
-                </p>
-                {clip.isTranscribing ? (
-                  <div className="flex items-center text-yellow-600">
-                    <div className="w-2 h-2 bg-yellow-600 rounded-full animate-pulse mr-2"></div>
-                    Transcribing...
-                  </div>
-                ) : clip.transcriptionError ? (
-                  <p className="text-red-600">
-                    Transcription error: {clip.transcriptionError}
-                  </p>
-                ) : (
-                  <>
-                    {clip.transcription && (
-                      <div className="mb-4">
-                        <h4 className="font-semibold mb-1">
-                          Full Transcription:
-                        </h4>
-                        <p className="text-gray-800 bg-white p-2 rounded">
-                          {clip.transcription}
-                        </p>
-                      </div>
+          {lastResponseTime && (
+            <div className="text-sm text-gray-500">
+              Last updated: {new Date(lastResponseTime).toLocaleTimeString()}
+            </div>
+          )}
+
+          {transcription.timestamps && (
+            <div>
+              <h4 className="font-bold mb-2">Word Timestamps:</h4>
+              <div className="flex flex-wrap gap-2">
+                {transcription.timestamps.words.map((word, index) => (
+                  <span
+                    key={index}
+                    className="inline-block bg-gray-100 px-2 py-1 rounded text-sm"
+                  >
+                    {word} (
+                    {transcription.timestamps!.start_time_seconds[
+                      index
+                    ].toFixed(2)}
+                    s -
+                    {transcription.timestamps!.end_time_seconds[index].toFixed(
+                      2
                     )}
-                    {clip.speakers && clip.speakers.length > 0 && (
-                      <div>
-                        <h4 className="font-semibold mb-2">Speakers:</h4>
-                        <ul className="space-y-2">
-                          {clip.speakers.map((utterance, index) => (
-                            <li key={index} className="bg-white p-2 rounded">
-                              <span className="font-medium text-blue-600">
-                                Speaker {utterance.speaker}:
-                              </span>{" "}
-                              <span className="text-gray-800">
-                                {utterance.text}
-                              </span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
-                  </>
-                )}
-              </li>
-            ))}
-          </ul>
+                    s)
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 };
 
-export default VoiceDetector;
+export default RealtimeSpeechToText;

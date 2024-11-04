@@ -16,6 +16,8 @@
     "@ricky0123/vad": "^0.2.4",
     "@ricky0123/vad-web": "^0.0.19",
     "assemblyai": "^4.7.1",
+    "audio-buffer-from": "^1.1.1",
+    "audiobuffer-to-wav": "^1.0.0",
     "axios": "^1.7.7",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
@@ -28,6 +30,7 @@
     "tailwind-merge": "^2.5.4",
     "tailwindcss-animate": "^1.0.7",
     "voice-activity-detection": "^0.0.5",
+    "wav-encoder": "^1.3.0",
     "web-voice-detection": "^1.0.6"
   },
   "devDependencies": {
