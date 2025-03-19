@@ -1,7 +1,14 @@
 "use client";
+
 import React, { useState, useRef, useEffect } from "react";
 import { CobraWorker } from "@picovoice/cobra-web";
 import { WebVoiceProcessor } from "@picovoice/web-voice-processor";
+import { WaveFile } from "wavefile";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Mic, MicOff, Loader2, Volume2, Settings2 } from "lucide-react";
 
 interface Timestamps {
   words: string[];
@@ -14,100 +21,109 @@ interface TranscriptionResponse {
   timestamps: Timestamps | null;
 }
 
-// Environment variable type declarations
-declare global {
-  interface Window {
-    ENV: {
-      PICOVOICE_ACCESS_KEY: string;
-      ASSEMBLY_API_KEY: string;
-      SARVAM_API_KEY: string;
+// Configuration constants
+const VOICE_PROBABILITY_THRESHOLD = 0.4;
+const SILENCE_DURATION_THRESHOLD = 750;
+const MIN_RECORDING_DURATION = 250;
+const MAX_RECORDING_DURATION = 3000;
+const RECORDING_CHUNK_SIZE = 250;
+
+// Audio Visualizer Component
+const AudioVisualizer = ({ isListening }: { isListening: boolean }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animationFrameRef = useRef<number>();
+  const analyzerRef = useRef<AnalyserNode | null>(null);
+
+  useEffect(() => {
+    if (!isListening || !canvasRef.current) return;
+
+    const audioContext = new (window.AudioContext ||
+      (window as any).webkitAudioContext)();
+    const analyzer = audioContext.createAnalyser();
+    analyzerRef.current = analyzer;
+    analyzer.fftSize = 256;
+
+    navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyzer);
+
+      const bufferLength = analyzer.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+      const canvas = canvasRef.current!;
+      const ctx = canvas.getContext("2d")!;
+
+      const draw = () => {
+        const width = canvas.width;
+        const height = canvas.height;
+
+        analyzer.getByteFrequencyData(dataArray);
+
+        ctx.fillStyle = "rgb(23, 23, 23)";
+        ctx.fillRect(0, 0, width, height);
+
+        const barWidth = (width / bufferLength) * 2.5;
+        let barHeight;
+        let x = 0;
+
+        for (let i = 0; i < bufferLength; i++) {
+          barHeight = dataArray[i] / 2;
+
+          const gradient = ctx.createLinearGradient(0, 0, 0, height);
+          gradient.addColorStop(0, "#3b82f6");
+          gradient.addColorStop(1, "#1d4ed8");
+
+          ctx.fillStyle = gradient;
+          ctx.fillRect(x, height - barHeight, barWidth, barHeight);
+
+          x += barWidth + 1;
+        }
+
+        animationFrameRef.current = requestAnimationFrame(draw);
+      };
+
+      draw();
+    });
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+      if (audioContext.state !== "closed") {
+        audioContext.close();
+      }
     };
-  }
-}
+  }, [isListening]);
 
-// Constants for voice detection and silence handling
-const VOICE_PROBABILITY_THRESHOLD = 0.5;
-const SILENCE_DURATION_THRESHOLD = 1500; // 1.5 seconds of silence before stopping
-const MIN_RECORDING_DURATION = 500; // Minimum recording duration of 0.5 seconds
-const DEBUG = true;
+  return (
+    <canvas
+      ref={canvasRef}
+      className="w-full h-32 rounded-lg bg-background"
+      width={800}
+      height={128}
+    />
+  );
+};
 
-// Get environment variables
 const getEnvVariables = () => ({
-  PICOVOICE_ACCESS_KEY: process.env.NEXT_PUBLIC_PICOVOICE_ACCESS_KEY,
-  ASSEMBLY_API_KEY: process.env.NEXT_PUBLIC_ASSEMBLY_API_KEY,
-  SARVAM_API_KEY: process.env.NEXT_PUBLIC_API_KEY,
+  PICOVOICE_ACCESS_KEY:
+    "KQFW1maCtiLd2xAeMMwttKqPzLH5k+QK6N3pfi9p83dGFDu0QlVxMA==",
+  SARVAM_API_KEY: "10d6bcd2-3f43-4527-9159-98c31f0d487b",
 });
 
-// Helper function to convert float32 to 16-bit PCM
-function floatTo16BitPCM(
-  output: DataView,
-  offset: number,
-  input: Float32Array
-) {
-  for (let i = 0; i < input.length; i++, offset += 2) {
-    const s = Math.max(-1, Math.min(1, input[i]));
-    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
-}
+async function audioBufferToWav(audioBuffer: AudioBuffer): Promise<Blob> {
+  const wav = new WaveFile();
+  const samples = new Int16Array(audioBuffer.length);
+  const leftChannel = audioBuffer.getChannelData(0);
 
-// Helper function to write string to DataView
-function writeString(view: DataView, offset: number, string: string) {
-  for (let i = 0; i < string.length; i++) {
-    view.setUint8(offset + i, string.charCodeAt(i));
-  }
-}
-
-// Convert AudioBuffer to WAV Blob
-function bufferToWav(audioBuffer: AudioBuffer): Blob {
-  const numOfChan = audioBuffer.numberOfChannels;
-  const length = audioBuffer.length * numOfChan * 2;
-  const buffer = new ArrayBuffer(44 + length);
-  const view = new DataView(buffer);
-  let pos = 0;
-
-  // write WAVE header
-  writeString(view, pos, "RIFF");
-  pos += 4;
-  view.setUint32(pos, 36 + length, true);
-  pos += 4;
-  writeString(view, pos, "WAVE");
-  pos += 4;
-  writeString(view, pos, "fmt ");
-  pos += 4;
-  view.setUint32(pos, 16, true);
-  pos += 4;
-  view.setUint16(pos, 1, true);
-  pos += 2;
-  view.setUint16(pos, numOfChan, true);
-  pos += 2;
-  view.setUint32(pos, audioBuffer.sampleRate, true);
-  pos += 4;
-  view.setUint32(pos, audioBuffer.sampleRate * numOfChan * 2, true);
-  pos += 4;
-  view.setUint16(pos, numOfChan * 2, true);
-  pos += 2;
-  view.setUint16(pos, 16, true);
-  pos += 2;
-  writeString(view, pos, "data");
-  pos += 4;
-  view.setUint32(pos, length, true);
-  pos += 4;
-
-  // write PCM data
-  const data = new Float32Array(audioBuffer.length * numOfChan);
-  let offset = 0;
-
-  for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
-    data.set(audioBuffer.getChannelData(i), offset);
-    offset += audioBuffer.length;
+  for (let i = 0; i < leftChannel.length; i++) {
+    const s = Math.max(-1, Math.min(1, leftChannel[i]));
+    samples[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
 
-  floatTo16BitPCM(view, 44, data);
-
-  return new Blob([buffer], { type: "audio/wav" });
+  wav.fromScratch(1, audioBuffer.sampleRate, "16", samples);
+  return new Blob([wav.toBuffer()], { type: "audio/wav" });
 }
 
-// Convert Blob to AudioBuffer
 async function blobToAudioBuffer(
   blob: Blob,
   audioContext: AudioContext
@@ -125,27 +141,87 @@ const RealtimeSpeechToText = () => {
     useState<TranscriptionResponse | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastResponseTime, setLastResponseTime] = useState<number | null>(null);
+  const [partialTranscript, setPartialTranscript] = useState<string>("");
 
-  // Refs for managing state across callbacks
   const isListeningRef = useRef(false);
   const isRecordingRef = useRef(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const recordingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const cobraRef = useRef<CobraWorker | null>(null);
   const recordingStartTimeRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const processingQueueRef = useRef<Promise<void>>(Promise.resolve());
 
-  // Initialize voice detector and audio setup
+  const processAndSendAudio = async (audioBlob: Blob) => {
+    const newProcessing = async () => {
+      try {
+        setIsProcessing(true);
+        const env = getEnvVariables();
+        if (!env.SARVAM_API_KEY || !audioContextRef.current) return;
+
+        const audioBuffer = await blobToAudioBuffer(
+          audioBlob,
+          audioContextRef.current
+        );
+        const wavBlob = await audioBufferToWav(audioBuffer);
+
+        const formData = new FormData();
+        formData.append("file", wavBlob, "recording.wav");
+        formData.append("language_code", "hi-IN");
+        formData.append("model", "saarika:v1");
+        formData.append("with_timestamps", "true");
+
+        console.log("Sending request to speech-to-text API...");
+
+        const response = await fetch("https://api.sarvam.ai/speech-to-text", {
+          method: "POST",
+          headers: {
+            "api-subscription-key": env.SARVAM_API_KEY,
+          },
+          body: formData,
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`API Error (${response.status}): ${errorText}`);
+        }
+
+        const data = await response.json();
+        console.log("Received response:", data);
+
+        setLastResponseTime(Date.now());
+        setTranscription((prev) => ({
+          transcript: prev
+            ? `${prev.transcript} ${data.transcript}`
+            : data.transcript,
+          timestamps: data.timestamps,
+        }));
+        setPartialTranscript("");
+        setIsProcessing(false);
+      } catch (err) {
+        console.error("Transcription error:", err);
+        setError(err instanceof Error ? err.message : "Transcription failed");
+        setIsProcessing(false);
+      }
+    };
+
+    processingQueueRef.current = processingQueueRef.current.then(newProcessing);
+  };
+
   const initializeVoiceDetector = async () => {
     try {
       const env = getEnvVariables();
-
       if (!env.PICOVOICE_ACCESS_KEY) {
-        throw new Error(
-          "Picovoice access key is not configured in environment variables"
-        );
+        throw new Error("Picovoice access key not configured");
       }
+
+      audioContextRef.current = new (window.AudioContext ||
+        (window as any).webkitAudioContext)({
+        sampleRate: 16000,
+      });
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -159,27 +235,21 @@ const RealtimeSpeechToText = () => {
 
       streamRef.current = stream;
 
-      const handleVoiceProbability = (probability: number) => {
-        if (DEBUG) {
-          console.log("Voice probability:", probability);
-        }
-        if (probability >= VOICE_PROBABILITY_THRESHOLD) {
-          void handleVoiceDetected();
-        } else {
-          handleSilenceDetected();
-        }
-      };
-
       const cobraInstance = await CobraWorker.create(
         env.PICOVOICE_ACCESS_KEY,
-        handleVoiceProbability
+        (probability: number) => {
+          if (probability >= VOICE_PROBABILITY_THRESHOLD) {
+            void handleVoiceDetected();
+          } else {
+            handleSilenceDetected();
+          }
+        }
       );
 
       cobraRef.current = cobraInstance;
       setIsInitialized(true);
       setError(null);
     } catch (err) {
-      console.error("Initialization error:", err);
       setError(
         err instanceof Error
           ? err.message
@@ -197,10 +267,8 @@ const RealtimeSpeechToText = () => {
     if (
       !isRecordingRef.current &&
       isListeningRef.current &&
-      streamRef.current &&
-      !isProcessing
+      streamRef.current
     ) {
-      if (DEBUG) console.log("Voice detected, starting recording");
       await startRecording();
     }
   };
@@ -208,113 +276,29 @@ const RealtimeSpeechToText = () => {
   const handleSilenceDetected = () => {
     if (!silenceTimeoutRef.current && isRecordingRef.current) {
       silenceTimeoutRef.current = setTimeout(() => {
-        if (DEBUG) console.log("Silence detected, stopping recording");
         stopRecording();
         silenceTimeoutRef.current = null;
       }, SILENCE_DURATION_THRESHOLD);
     }
   };
 
-  const processAndSendAudio = async (audioBlob: Blob) => {
-    try {
-      const env = getEnvVariables();
-
-      if (!env.SARVAM_API_KEY) {
-        throw new Error(
-          "Sarvam API key is not configured in environment variables"
-        );
-      }
-
-      if (DEBUG) {
-        console.log("Processing audio:", {
-          originalSize: audioBlob.size,
-          originalType: audioBlob.type,
-        });
-      }
-
-      // Create AudioContext with specific sample rate
-      const audioContext = new (window.AudioContext ||
-        (window as any).webkitAudioContext)({
-        sampleRate: 16000,
-      });
-
-      // Convert blob to AudioBuffer
-      const audioBuffer = await blobToAudioBuffer(audioBlob, audioContext);
-
-      // Convert to WAV
-      const wavBlob = bufferToWav(audioBuffer);
-
-      if (DEBUG) {
-        console.log("Converted audio:", {
-          wavSize: wavBlob.size,
-          wavType: wavBlob.type,
-          sampleRate: audioBuffer.sampleRate,
-          channels: audioBuffer.numberOfChannels,
-          duration: audioBuffer.duration,
-        });
-      }
-
-      const formData = new FormData();
-      formData.append("file", wavBlob, "recording.wav");
-      formData.append("language_code", "hi-IN");
-      formData.append("model", "saarika:v1");
-      formData.append("with_timestamps", "true");
-
-      const response = await fetch("https://api.sarvam.ai/speech-to-text", {
-        method: "POST",
-        headers: {
-          "api-subscription-key": env.SARVAM_API_KEY,
-        },
-        body: formData,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`API Error (${response.status}): ${errorText}`);
-      }
-
-      const data = await response.json();
-      setLastResponseTime(Date.now());
-
-      if (DEBUG) {
-        console.log("API Response:", data);
-      }
-
-      setTranscription((prev) => ({
-        transcript: prev
-          ? prev.transcript + " " + data.transcript
-          : data.transcript,
-        timestamps: data.timestamps,
-      }));
-    } catch (err) {
-      console.error("API Error:", err);
-      setError(err instanceof Error ? err.message : "Transcription failed");
-    }
-  };
-
   const startRecording = async () => {
-    if (
-      !streamRef.current ||
-      mediaRecorderRef.current?.state === "recording" ||
-      isProcessing
-    ) {
+    if (!streamRef.current || mediaRecorderRef.current?.state === "recording")
       return;
-    }
-
-    setIsProcessing(true);
 
     try {
       const options = {
         mimeType: "audio/webm;codecs=opus",
-        bitsPerSecond: 16000,
+        bitsPerSecond: 128000,
+        audioBitsPerSecond: 128000,
+        videoBitsPerSecond: 0,
       };
 
       const mediaRecorder = new MediaRecorder(streamRef.current, options);
       mediaRecorderRef.current = mediaRecorder;
       chunksRef.current = [];
 
-      const startTime = Date.now();
-      recordingStartTimeRef.current = startTime;
+      recordingStartTimeRef.current = Date.now();
 
       mediaRecorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
@@ -323,65 +307,60 @@ const RealtimeSpeechToText = () => {
       };
 
       mediaRecorder.onstop = async () => {
-        try {
-          const duration = Date.now() - (recordingStartTimeRef.current || 0);
-
-          if (
-            duration >= MIN_RECORDING_DURATION &&
-            chunksRef.current.length > 0
-          ) {
-            const audioBlob = new Blob(chunksRef.current, {
-              type: "audio/webm;codecs=opus",
-            });
-            await processAndSendAudio(audioBlob);
-          }
-        } catch (err) {
-          console.error("Error processing recording:", err);
-          setError("Failed to process recording");
-        } finally {
-          chunksRef.current = [];
-          isRecordingRef.current = false;
-          recordingStartTimeRef.current = null;
-          setIsRecording(false);
-          setIsProcessing(false);
+        const duration = Date.now() - (recordingStartTimeRef.current || 0);
+        if (
+          duration >= MIN_RECORDING_DURATION &&
+          chunksRef.current.length > 0
+        ) {
+          const audioBlob = new Blob(chunksRef.current, {
+            type: "audio/webm;codecs=opus",
+          });
+          void processAndSendAudio(audioBlob);
         }
+        chunksRef.current = [];
+        isRecordingRef.current = false;
+        recordingStartTimeRef.current = null;
+        setIsRecording(false);
       };
 
-      mediaRecorder.start(500); // Record in 500ms chunks
+      mediaRecorder.start(RECORDING_CHUNK_SIZE);
       isRecordingRef.current = true;
       setIsRecording(true);
+
+      recordingTimeoutRef.current = setTimeout(() => {
+        if (mediaRecorder.state === "recording") {
+          stopRecording();
+        }
+      }, MAX_RECORDING_DURATION);
     } catch (err) {
-      console.error("Recording error:", err);
       setError("Failed to start recording");
-      setIsProcessing(false);
     }
   };
 
   const stopRecording = () => {
     if (mediaRecorderRef.current?.state === "recording") {
-      if (DEBUG) console.log("Stopping recording");
       mediaRecorderRef.current.stop();
+    }
+    if (recordingTimeoutRef.current) {
+      clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
     }
   };
 
   const startListening = async () => {
     if (!isInitialized || !cobraRef.current) return;
-
     try {
       await WebVoiceProcessor.subscribe(cobraRef.current);
       isListeningRef.current = true;
       setIsListening(true);
       setError(null);
-      if (DEBUG) console.log("Started listening for voice activity");
     } catch (err) {
-      console.error("Start listening error:", err);
       setError("Failed to start listening");
     }
   };
 
   const stopListening = async () => {
     if (!isListeningRef.current || !cobraRef.current) return;
-
     try {
       await WebVoiceProcessor.unsubscribe(cobraRef.current);
       if (isRecordingRef.current) {
@@ -390,16 +369,13 @@ const RealtimeSpeechToText = () => {
       isListeningRef.current = false;
       setIsListening(false);
       setError(null);
-      if (DEBUG) console.log("Stopped listening for voice activity");
     } catch (err) {
-      console.error("Stop listening error:", err);
       setError("Failed to stop listening");
     }
   };
 
   useEffect(() => {
     void initializeVoiceDetector();
-
     return () => {
       if (isListeningRef.current && cobraRef.current) {
         void WebVoiceProcessor.unsubscribe(cobraRef.current);
@@ -410,88 +386,139 @@ const RealtimeSpeechToText = () => {
       if (cobraRef.current) {
         void cobraRef.current.release();
       }
+      if (audioContextRef.current) {
+        void audioContextRef.current.close();
+      }
     };
   }, []);
 
   return (
-    <div className="p-4">
-      {error && (
-        <div className="mb-4 p-4 bg-red-100 text-red-700 rounded">{error}</div>
-      )}
-
-      <div className="mb-4 flex items-center gap-4">
-        {isListening ? (
-          <button
-            onClick={() => void stopListening()}
-            className="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600 transition-colors"
-          >
-            Stop Listening
-          </button>
-        ) : (
-          <button
-            onClick={() => void startListening()}
-            className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            disabled={!isInitialized}
-          >
-            Start Listening
-          </button>
-        )}
-
-        {isRecording && (
-          <div className="flex items-center text-yellow-600">
-            <div className="w-2 h-2 bg-yellow-600 rounded-full animate-pulse mr-2"></div>
-            Recording...
+    <div className="p-4 space-y-6">
+      <Card className="w-full max-w-4xl mx-auto bg-gradient-to-br from-background to-muted/50">
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle className="flex items-center gap-2">
+              <Volume2 className="w-6 h-6 text-primary" />
+              Real-time Speech to Text
+            </CardTitle>
+            <Button variant="ghost" size="icon">
+              <Settings2 className="w-5 h-5" />
+            </Button>
           </div>
-        )}
-
-        {isProcessing && !isRecording && (
-          <div className="flex items-center text-blue-600">
-            <div className="w-2 h-2 bg-blue-600 rounded-full animate-pulse mr-2"></div>
-            Processing...
-          </div>
-        )}
-      </div>
-
-      {transcription && (
-        <div className="mt-4 space-y-4">
-          <div>
-            <h3 className="font-bold text-lg mb-2">Transcription:</h3>
-            <p className="p-4 bg-gray-50 rounded shadow-sm">
-              {transcription.transcript}
-            </p>
-          </div>
-
-          {lastResponseTime && (
-            <div className="text-sm text-gray-500">
-              Last updated: {new Date(lastResponseTime).toLocaleTimeString()}
-            </div>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          {error && (
+            <Alert variant="destructive">
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
           )}
+          <div className="space-y-4">
+            <div className="flex items-center gap-4">
+              {isListening ? (
+                <Button
+                  onClick={() => void stopListening()}
+                  variant="destructive"
+                  className="w-40 relative overflow-hidden group"
+                >
+                  <div className="absolute inset-0 bg-red-500/20 group-hover:bg-red-500/30 transition-colors" />
+                  <MicOff className="mr-2 h-4 w-4" />
+                  Stop Listening
+                </Button>
+              ) : (
+                <Button
+                  onClick={() => void startListening()}
+                  variant="default"
+                  className="w-40 relative overflow-hidden group"
+                  disabled={!isInitialized}
+                >
+                  <div className="absolute inset-0 bg-primary/20 group-hover:bg-primary/30 transition-colors" />
+                  <Mic className="mr-2 h-4 w-4" />
+                  Start Listening
+                </Button>
+              )}
 
-          {transcription.timestamps && (
-            <div>
-              <h4 className="font-bold mb-2">Word Timestamps:</h4>
-              <div className="flex flex-wrap gap-2">
-                {transcription.timestamps.words.map((word, index) => (
-                  <span
-                    key={index}
-                    className="inline-block bg-gray-100 px-2 py-1 rounded text-sm"
-                  >
-                    {word} (
-                    {transcription.timestamps!.start_time_seconds[
-                      index
-                    ].toFixed(2)}
-                    s -
-                    {transcription.timestamps!.end_time_seconds[index].toFixed(
-                      2
+              {isRecording && (
+                <Badge variant="warning" className="animate-pulse">
+                  <div className="w-2 h-2 bg-yellow-600 rounded-full mr-2"></div>
+                  Recording...
+                </Badge>
+              )}
+            </div>
+
+            <div className="relative">
+              <AudioVisualizer isListening={isListening} />
+              {!isListening && (
+                <div className="absolute inset-0 flex items-center justify-center bg-background/80 backdrop-blur-sm rounded-lg">
+                  <p className="text-muted-foreground">
+                    Start listening to see audio visualization
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <h3 className="text-lg font-semibold mb-2 flex items-center gap-2">
+                  <span>Transcription</span>
+                  {isProcessing && <Loader2 className="w-4 h-4 animate-spin" />}
+                </h3>
+                <Card className="bg-muted/30">
+                  <CardContent className="pt-6 min-h-[100px]">
+                    {transcription?.transcript}
+                    {partialTranscript && (
+                      <span className="text-muted-foreground">
+                        {" "}
+                        {partialTranscript}
+                      </span>
                     )}
-                    s)
-                  </span>
-                ))}
+                    {!transcription?.transcript && !partialTranscript && (
+                      <p className="text-muted-foreground italic">
+                        Your transcription will appear here...
+                      </p>
+                    )}
+                  </CardContent>
+                </Card>
               </div>
+
+              {lastResponseTime && (
+                <p className="text-sm text-muted-foreground flex items-center gap-2">
+                  <span className="w-2 h-2 rounded-full bg-green-500"></span>
+                  Last updated:{" "}
+                  {new Date(lastResponseTime).toLocaleTimeString()}
+                </p>
+              )}
+
+              {transcription?.timestamps && (
+                <div className="border-t pt-4">
+                  <h4 className="font-semibold mb-2">Word Timestamps</h4>
+                  <div className="flex flex-wrap gap-2">
+                    {transcription.timestamps.words.map((word, index) => (
+                      <Badge
+                        key={index}
+                        variant="secondary"
+                        className="text-xs hover:bg-primary/20 transition-colors cursor-default"
+                      >
+                        {word}{" "}
+                        <span className="ml-1 opacity-70">
+                          (
+                          {transcription.timestamps!.start_time_seconds[
+                            index
+                          ].toFixed(2)}
+                          s -
+                          {transcription.timestamps!.end_time_seconds[
+                            index
+                          ].toFixed(2)}
+                          s)
+                        </span>
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
-          )}
-        </div>
-      )}
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 };
